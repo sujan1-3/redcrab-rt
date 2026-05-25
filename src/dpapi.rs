@@ -1,9 +1,8 @@
 //! dpapi.rs — Credential blob encryption/decryption via CryptProtectData / CryptUnprotectData
 #![allow(dead_code, non_snake_case)]
 
-use winapi::um::wincrypt::{
-    CryptProtectData, CryptUnprotectData, DATA_BLOB, CRYPTPROTECT_LOCAL_MACHINE,
-};
+use winapi::um::dpapi::{CryptProtectData, CryptUnprotectData, CRYPTPROTECT_LOCAL_MACHINE};
+use winapi::um::wincrypt::DATA_BLOB;
 use winapi::um::winbase::LocalFree;
 use winapi::shared::minwindef::DWORD;
 
@@ -20,15 +19,14 @@ pub unsafe fn dpapi_encrypt(plaintext: &[u8]) -> Option<Vec<u8>> {
         core::ptr::null_mut(),
         core::ptr::null_mut(),
         core::ptr::null_mut(),
-        0,
+        CRYPTPROTECT_LOCAL_MACHINE,
         &mut out_blob,
     );
     if ok == 0 { return None; }
 
-    let slice = core::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize);
-    let result = slice.to_vec();
+    let data = core::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
     LocalFree(out_blob.pbData as *mut _);
-    Some(result)
+    Some(data)
 }
 
 pub unsafe fn dpapi_decrypt(ciphertext: &[u8]) -> Option<Vec<u8>> {
@@ -49,8 +47,7 @@ pub unsafe fn dpapi_decrypt(ciphertext: &[u8]) -> Option<Vec<u8>> {
     );
     if ok == 0 { return None; }
 
-    let slice = core::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize);
-    let result = slice.to_vec();
+    let data = core::slice::from_raw_parts(out_blob.pbData, out_blob.cbData as usize).to_vec();
     LocalFree(out_blob.pbData as *mut _);
-    Some(result)
+    Some(data)
 }
