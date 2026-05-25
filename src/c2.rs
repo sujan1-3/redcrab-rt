@@ -8,7 +8,6 @@ use winapi::um::winhttp::{
     WinHttpCloseHandle, WinHttpSetOption, WinHttpQueryHeaders,
     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
     WINHTTP_FLAG_SECURE,
-    WINHTTP_NO_ADDITIONAL_HEADERS, WINHTTP_NO_REQUEST_DATA,
     WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
 };
 use winapi::um::sysinfoapi::GetComputerNameW;

