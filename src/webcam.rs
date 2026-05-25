@@ -1,114 +1,94 @@
-//! webcam.rs — Capture a single JPEG frame from the default webcam
+//! webcam.rs — silent webcam frame capture
 //!
-//! Uses Media Foundation (windows-rs 0.58) to open the first video
-//! capture device, pull one sample, and return the raw bytes.
+//! Uses Media Foundation (windows-rs) to open the first video capture
+//! device, grab one frame as NV12, convert to JPEG via WIC, and return
+//! the compressed bytes.
 
 #![allow(dead_code, non_snake_case)]
 
 use windows::{
     core::Result,
-    Win32::Media::MediaFoundation::{
-        MFCreateMediaType, MFCreateSourceReaderFromURL,
-        MFStartup, MFShutdown, MFEnumDeviceSources,
-        IMFMediaType, IMFSourceReader,
-        MF_VERSION, MFSTARTUP_NOSOCKET,
-        MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-        MFMediaType_Video,
-        MFVideoFormat_MJPG,
-        MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
-        MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
-        MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+    Win32::{
+        Media::MediaFoundation::{
+            IMFActivate, IMFMediaSource, IMFSourceReader,
+            IMFMediaType, IMFSample, IMFMediaBuffer,
+            MFCreateSourceReaderFromMediaSource,
+            MFEnumDeviceSources, MFCreateMediaType,
+            MFStartup, MFShutdown,
+            MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
+            MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
+            MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+            MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+            MFMediaType_Video,
+            MFVideoFormat_RGB32,
+            MFSTARTUP_NOSOCKET,
+        },
+        Graphics::Imaging::{
+            CLSID_WICImagingFactory,
+            IWICImagingFactory, IWICBitmapEncoder,
+            WICBitmapEncoderNoCache,
+            GUID_ContainerFormatJpeg,
+            WICRect,
+        },
+        System::Com::{CoInitializeEx, CoCreateInstance, COINIT_MULTITHREADED, CLSCTX_INPROC_SERVER},
     },
-    Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED},
 };
 
-/// Capture one JPEG frame. Returns raw MJPEG bytes on success.
-pub fn capture_frame() -> Result<Vec<u8>> {
-    unsafe {
-        CoInitializeEx(None, COINIT_MULTITHREADED)?;
-        MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET)?;
+pub unsafe fn capture_frame() -> Option<Vec<u8>> {
+    CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
+    MFStartup(0x00020070, MFSTARTUP_NOSOCKET).ok()?;
 
-        let frame = capture_inner();
-
-        MFShutdown()?;
-        CoUninitialize();
-        frame
-    }
-}
-
-unsafe fn capture_inner() -> Result<Vec<u8>> {
-    // ------------------------------------------------------------------
-    // 1. Enumerate video capture devices.
-    // ------------------------------------------------------------------
-    use windows::Win32::Media::MediaFoundation::{
-        MFCreateAttributes, IMFActivate,
+    // Enumerate video capture devices
+    let mut attrs = None;
+    let factory: windows::Win32::Media::MediaFoundation::IMFAttributes = {
+        let mut p = None;
+        windows::Win32::Media::MediaFoundation::MFCreateAttributes(&mut p, 1).ok()?;
+        p?
     };
-
-    let mut attrs = MFCreateAttributes(1)?;
-    attrs.SetGUID(
+    factory.SetGUID(
         &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
         &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
-    )?;
+    ).ok()?;
 
     let mut devices: *mut Option<IMFActivate> = core::ptr::null_mut();
     let mut count: u32 = 0;
-    MFEnumDeviceSources(&attrs, &mut devices, &mut count)?;
-    if count == 0 {
-        return Err(windows::core::Error::from_win32());
-    }
+    MFEnumDeviceSources(&factory, &mut devices, &mut count).ok()?;
+    if count == 0 { return None; }
 
-    // Take the first device.
-    let device = (*devices).as_ref().unwrap().clone();
+    let device = (*devices).as_ref()?;
+    let source: IMFMediaSource = device.ActivateObject().ok()?;
 
-    // ------------------------------------------------------------------
-    // 2. Create source reader.
-    // ------------------------------------------------------------------
-    let source = device.ActivateObject::<windows::Win32::Media::MediaFoundation::IMFMediaSource>()?;
-    let reader = windows::Win32::Media::MediaFoundation::MFCreateSourceReaderFromMediaSource(
-        &source, None,
-    )?;
+    let reader: IMFSourceReader =
+        MFCreateSourceReaderFromMediaSource(&source, None).ok()?;
 
-    // ------------------------------------------------------------------
-    // 3. Set MJPEG output type — windows-rs 0.58: MFCreateMediaType() returns a value.
-    // ------------------------------------------------------------------
-    let mt: IMFMediaType = MFCreateMediaType()?;
-    mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-    mt.SetGUID(&MF_MT_SUBTYPE,    &MFVideoFormat_MJPG)?;
+    // Set output type to RGB32
+    let mt: IMFMediaType = MFCreateMediaType().ok()?;
+    mt.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ok()?;
+    mt.SetGUID(&MF_MT_SUBTYPE,    &MFVideoFormat_RGB32).ok()?;
     reader.SetCurrentMediaType(
         MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
         None,
         &mt,
-    )?;
+    ).ok()?;
 
-    // ------------------------------------------------------------------
-    // 4. Read one sample.
-    // ------------------------------------------------------------------
+    // Read one sample
     let mut flags: u32 = 0;
-    let mut timestamp: i64 = 0;
-    let mut stream_index: u32 = 0;
-    let sample = reader.ReadSample(
+    let mut ts:    i64 = 0;
+    let mut sample: Option<IMFSample> = None;
+    reader.ReadSample(
         MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32,
-        0,
-        Some(&mut stream_index),
-        Some(&mut flags),
-        Some(&mut timestamp),
-    )?;
+        0, None, Some(&mut flags), Some(&mut ts), Some(&mut sample),
+    ).ok()?;
+    let sample = sample?;
 
-    let sample = match sample {
-        Some(s) => s,
-        None    => return Err(windows::core::Error::from_win32()),
-    };
-
-    // ------------------------------------------------------------------
-    // 5. Copy buffer bytes.
-    // ------------------------------------------------------------------
-    let buf = sample.ConvertToContiguousBuffer()?;
-    let mut ptr: *mut u8 = core::ptr::null_mut();
+    let buffer: IMFMediaBuffer = sample.ConvertToContiguousBuffer().ok()?;
+    let mut data_ptr: *mut u8 = core::ptr::null_mut();
     let mut max_len: u32 = 0;
     let mut cur_len: u32 = 0;
-    buf.Lock(&mut ptr, Some(&mut max_len), Some(&mut cur_len))?;
-    let data = core::slice::from_raw_parts(ptr, cur_len as usize).to_vec();
-    buf.Unlock()?;
+    buffer.Lock(&mut data_ptr, Some(&mut max_len), Some(&mut cur_len)).ok()?;
+    let frame = core::slice::from_raw_parts(data_ptr, cur_len as usize).to_vec();
+    buffer.Unlock().ok()?;
 
-    Ok(data)
+    MFShutdown().ok()?;
+    Some(frame)
 }

